@@ -5,15 +5,25 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "camelCase")]
 pub enum Input {
-    #[serde(rename = "join")]
-    Join(JoinInput),
+    #[serde(rename = "register")]
+    Register(RegisterInput),
     #[serde(rename = "post")]
     Post(PostInput),
+    #[serde(rename = "signIn")]
+    SignIn(SignInInput)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct JoinInput {
+pub struct RegisterInput {
+    pub name: String,
+    pub password: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignInInput {
     pub name: String,
     pub password: String,
 }
@@ -93,6 +103,16 @@ pub enum OutputError {
     InvalidMessageBody,
     #[serde(rename = "invalid-password")]
     InvalidPassword,
+    #[serde(rename = "invalid-email")]
+    InvalidEmail,
+    #[serde(rename = "player-not-found")]
+    PlayerNotFound,
+    #[serde(rename = "unable-to-verify-password")]
+    UnableToVerifyPassword,
+    #[serde(rename = "logged-in-on-another-client")]
+    LoginOnOtherClient,
+    #[serde(rename = "failed-writing-player-to-database")]
+    FailedWritingPlayer,
 }
 
 #[derive(Debug, Clone)]

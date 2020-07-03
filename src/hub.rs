@@ -1,18 +1,22 @@
 use tokio::sync::{broadcast, RwLock};
 use std::time::Duration;
 use crate::model::user::User;
+use crate::tak::player::Player;
+use crate::database::Database;
 use uuid::Uuid;
-use log::info;
+use log::{info, error};
 use std::collections::HashMap;
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedReceiver;
-use crate::proto::{InputParcel, Input, JoinInput, OutputError, Output, OutputParcel, PostInput, JoinedOutput, MessageOutput};
+use crate::proto::{InputParcel, Input, RegisterInput, OutputError, Output, OutputParcel,
+     PostInput, JoinedOutput, MessageOutput, SignInInput};
 use regex::Regex;
 use tokio::time;
 
 pub struct Hub {
     output_sender: broadcast::Sender<OutputParcel>,
-    users: tokio::sync::RwLock<HashMap<Uuid, User>>,
+    players: tokio::sync::RwLock<HashMap<Uuid, Player>>,
+    database: Database,
 }
 
 const OUTPUT_CHANNEL_SIZE: usize = 16;
@@ -20,6 +24,7 @@ const MAX_MESSAGE_BODY_LENGTH: usize = 256;
 lazy_static! {
     static ref USER_NAME_REGEX: Regex = Regex::new("[A-Za-z\\s]{4,24}").unwrap();
     static ref GUEST_NAME_REGEX: Regex = Regex::new(r"Guest\d+").unwrap();
+    static ref VALID_EMAIL_REGEX: Regex = Regex::new(r"^[\w!#$%&’*+/=?`{|}~^-]+(?:\.[\w!#$%&’*+/=?`{|}~^-]+)*@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,6}$").unwrap();
 }
 
 impl Hub {
@@ -27,7 +32,8 @@ impl Hub {
         let (output_sender, _) = broadcast::channel(OUTPUT_CHANNEL_SIZE);
         Hub{
             output_sender,
-            users: Default::default(),
+            players: Default::default(),
+            database: Database::new(),
         }
     }
 
@@ -37,6 +43,7 @@ impl Hub {
 
     pub async fn run(&self, receiver: UnboundedReceiver<InputParcel>){
         // receiver.for_each(|input|{})
+
         let ticking_alive = self.tick_alive();
         let processing = receiver.for_each(|input_parcel| self.process(input_parcel));
         tokio::select!{
@@ -48,15 +55,17 @@ impl Hub {
 
     async fn process(&self, input_parcel: InputParcel){
         match input_parcel.input{
-            Input::Join(input) => self.process_join(input_parcel.client_id, input).await,
+            Input::Register(input) => self.process_register(input_parcel.client_id, input).await,
+            Input::SignIn(input) => self.process_sign_in(input_parcel.client_id, input).await,
             Input::Post(input) => self.process_post(input_parcel.client_id, input).await,
             _ => unreachable!()
         }
     }
 
-    async fn process_join(&self, client_id: Uuid, input: JoinInput){
+    async fn process_register(&self, client_id: Uuid, input: RegisterInput){
         let user_name = input.name.trim();
         let password = input.password.as_str();
+        let email = input.email.trim();
 
         // Validate user name
         if !USER_NAME_REGEX.is_match(user_name) {
@@ -64,26 +73,46 @@ impl Hub {
             return;
         }
 
-        //check to see if the user is already logged in
-        if self.users
+        // Validate email
+        if !VALID_EMAIL_REGEX.is_match(email) {
+            self.send_error(client_id, OutputError::InvalidEmail);
+            return;
+        }
+
+        //check to see if the user name exists in database
+        if let Ok(_) = self.database.get_user(user_name) {
+            self.send_error(client_id, OutputError::NameTaken);
+            return;
+        }
+
+        if self.players
             .read()
             .await
             .values()
-            .any(|user: &User| user.name == user_name){
+            .any(|user: &Player| user.name == user_name){
                 self.send_error(client_id, OutputError::NameTaken);
                 return;
         }
 
         //Validate the password
-        
-        if !self.validate_password(user_name, password){
-            self.send_error(client_id, OutputError::InvalidPassword);
-            return;
+        let player = Player::new(user_name, password, email, client_id, true);
+        match self.database.write_player(player.clone()) {
+            Ok(written) => {
+                if !written {
+                    self.send_error(client_id, OutputError::FailedWritingPlayer);
+                    return;
+                }
+            },
+            Err(err) => {
+                error!("Error writing to database: {}", err);
+                self.send_error(client_id, OutputError::FailedWritingPlayer);
+                return;
+            }
         }
 
         //add them to the list of users
-        let user = User::new(client_id, user_name);
-        self.users.write().await.insert(client_id, user);
+        // let user = User::new(client_id, user_name);
+        self.players.write().await.insert(client_id, player);
 
         self.send_targeted(client_id, Output::Joined(JoinedOutput::new(true)));
 
@@ -91,7 +120,7 @@ impl Hub {
 
     async fn process_post(&self, client_id: Uuid, input: PostInput){
 
-        let user = if let Some(user) = self.users.read().await.get(&client_id){
+        let user = if let Some(user) = self.players.read().await.get(&client_id){
             user.clone()
         } else{
             self.send_error(client_id, OutputError::NotJoined);
@@ -111,6 +140,61 @@ impl Hub {
 
     }
 
+    async fn process_sign_in(&self, client_id: Uuid, input: SignInInput){
+        let user_name = input.name.trim();
+        let password = input.password;
+        
+        // Validate user name
+        if !USER_NAME_REGEX.is_match(user_name) {
+            self.send_error(client_id, OutputError::InvalidName);
+            return;
+        }
+
+        //if the user is a guest, skip the rest of the validation.
+        if GUEST_NAME_REGEX.is_match(user_name) {
+            let guest = Player::new(user_name, "", "", client_id, true);
+            self.players.write().await.insert(client_id, guest);
+            self.send_targeted(client_id, Output::Joined(JoinedOutput::new(true)));
+            return;
+        }
+
+        let mut player = if let Ok(player) = self.database.get_user(user_name){
+            info!("Found player {:?}", player);
+            player
+        } else {
+            self.send_error(client_id, OutputError::PlayerNotFound);
+            return;
+        };
+
+        if let Ok(is_pass_valid) = Player::verify_password(password, &player.password) {
+            if !is_pass_valid {
+                self.send_error(client_id, OutputError::InvalidPassword);
+                return;
+            }
+        } else {
+            self.send_error(client_id, OutputError::UnableToVerifyPassword);
+            return;
+        }
+
+        if let Some(_) =  player.get_client() {
+            self.send_error(client_id, OutputError::LoginOnOtherClient);
+            return;
+        }
+
+        if self.players.read().await.values().any(|player: &Player| {
+            player.name == user_name
+        }) {
+            self.send_error(client_id, OutputError::NameTaken);
+            return;
+        }
+
+        player.set_client(client_id); //set the player's client id
+        self.players.write().await.insert(client_id, player);
+
+        self.send_targeted(client_id, Output::Joined(JoinedOutput::new(true)));
+
+    }
+
     fn send_error(&self, client_id: Uuid, error: OutputError){
         self.send_targeted(client_id, Output::Error(error));
     }
@@ -125,9 +209,9 @@ impl Hub {
         if self.output_sender.receiver_count() == 0 {
             return;
         }
-        self.users.read().await.keys().for_each(|user_id| {
+        self.players.read().await.keys().for_each(|client_id| {
             self.output_sender
-                .send(OutputParcel::new(*user_id, output.clone()))
+                .send(OutputParcel::new(*client_id, output.clone()))
                 .unwrap();
         });
     }
@@ -142,7 +226,7 @@ impl Hub {
     }
 
     pub async fn on_disconnect(&self, client_id: Uuid){
-        if self.users.write().await.remove(&client_id).is_some() {
+        if self.players.write().await.remove(&client_id).is_some() {
             //TODO do something when the user is removed?
         }
     }
